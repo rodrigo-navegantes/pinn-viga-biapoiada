@@ -8,6 +8,6 @@
      w''(0)= 0   →  momento fletor nulo
      w''(L)= 0   →  momento fletor nulo
   
-  Solução analítica exata:
+- Solução analítica exata:
        w(x) = (q / (24·EI)) · x · (L³ - 2·L·x² + x³)
   
