@@ -2,14 +2,15 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
 L   = 1.0        
 EI  = 1.0        
 q   = 1.0        
 
-N_col  = 200      # 200 pontos distribuidos ao longo de x ∈ [0, 1]   
-EPOCHS = 5_000    # número de iterações
-LR     = 1e-3     # learning rate: controla o tamanho do passo que o otimizador dá a cada época para ajustar os pesos da rede. 
+N_col  = 200       # 200 pontos distribuidos ao longo de x ∈ [0, 1]   
+EPOCHS = 50_000    # número de iterações
+LR     = 1e-3      # learning rate: controla o tamanho do passo que o otimizador dá a cada época para ajustar os pesos da rede. 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Dispositivo: {DEVICE}")
@@ -19,7 +20,8 @@ np.random.seed(42)
 
 class PINN(nn.Module):
     """
-    MLP simples:  1 → [64, 64, 64, 64] → 1
+    Iniciamos a rede aqui
+    MLP simples:  1 > [64, 64, 64, 64] > 1
     Ativação: Tanh 
     """
     def __init__(self, hidden: int = 64, layers: int = 4):
@@ -30,6 +32,7 @@ class PINN(nn.Module):
         seq.append(nn.Linear(hidden, 1))
         self.net = nn.Sequential(*seq)
 
+        # Xavier init: inicializa pesos de forma que a variância do gradiente seja estável em todas as camadas
         for m in self.net:
             if isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight)
@@ -38,6 +41,7 @@ class PINN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
+# esta função percorre o grafo quatro vezes para calcular ŵ⁴
 def nth_derivative(f: torch.Tensor, x: torch.Tensor, n: int) -> torch.Tensor:
     df = f
     for _ in range(n):
@@ -49,9 +53,10 @@ def nth_derivative(f: torch.Tensor, x: torch.Tensor, n: int) -> torch.Tensor:
         )
     return df
 
+# calcúlo da perda por iteração
 def compute_loss(
     model: PINN,
-    x_col: torch.Tensor,   # pontos de colocação (interior)
+    x_col: torch.Tensor,   # pontos de colocação
     x_bc:  torch.Tensor,   # pontos de contorno
 ) -> tuple[torch.Tensor, dict]:
 
@@ -79,14 +84,14 @@ def compute_loss(
 
     return loss_total, {"pde": loss_pde.item(), "bc": loss_bc.item()}
 
-
 def w_analytical(x_np: np.ndarray) -> np.ndarray:
     return (q / (24.0 * EI)) * x_np * (L**3 - 2*L*x_np**2 + x_np**3)
 
-
+# usamos o ADAM como optimizador
 model     = PINN().to(DEVICE)
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
+# se a perda não cair por 500 épocas, reduz o lr pela metade. Evita que o otimizador "salte" sobre o mínimo no final do treinamento.
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, patience=500, factor=0.5, min_lr=1e-5
 )
@@ -100,6 +105,7 @@ history = {"total": [], "pde": [], "bc": []}
 print(f"\n{'Epoch':>8}  {'Loss total':>12}  {'L_pde':>10}  {'L_bc':>10}  {'LR':>8}")
 print("-" * 58)
 
+# Loop de treinamento
 for epoch in range(1, EPOCHS + 1):
     optimizer.zero_grad()
     loss, parts = compute_loss(model, x_col, x_bc)
@@ -118,11 +124,14 @@ for epoch in range(1, EPOCHS + 1):
 
 print("\nTreinamento concluído!")
 
+# Avaliação
+
 model.eval()
 
 x_test_np = np.linspace(0, L, 300, dtype=np.float32).reshape(-1, 1)
 x_test    = torch.tensor(x_test_np, device=DEVICE)
 
+# Desativamos o grafo computacional para a inferência
 with torch.no_grad():
     w_pred_np = model(x_test).cpu().numpy().flatten()
 
@@ -132,7 +141,7 @@ rel_error  = np.linalg.norm(error_np) / np.linalg.norm(w_exact_np)
 print(f"\nErro relativo L2: {rel_error:.4e}")
 
 fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-fig.suptitle("PINN – Viga de Euler-Bernoulli Biapoiada", fontsize=13, fontweight="bold")
+fig.suptitle(f"PINN – Viga de Euler-Bernoulli Biapoiada ({EPOCHS} ITERAÇÕES)", fontsize=13, fontweight="bold")
 
 ax = axes[0]
 ax.plot(x_test_np, w_exact_np * 1e3, "k-",  lw=2.5, label="Analítica")
@@ -159,6 +168,8 @@ ax.legend()
 ax.grid(True, which="both", alpha=0.35)
 
 plt.tight_layout()
-plt.savefig("pinn_euler_bernoulli.png", dpi=150, bbox_inches="tight")
+
+os.makedirs("outputs", exist_ok=True)
+plt.savefig("outputs/pinn_euler_bernoulli.png", dpi=150, bbox_inches="tight")
 plt.show()
-print("Gráfico salvo em pinn_euler_bernoulli.png")
+print("Gráfico salvo em outputs/pinn_euler_bernoulli.png")
