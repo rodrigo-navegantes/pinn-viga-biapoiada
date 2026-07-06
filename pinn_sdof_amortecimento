@@ -1,0 +1,287 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+WN_TRUE = 2 * np.pi * 2.0      # Frequência natural real
+ZETA_TRUE = 0.05               # Taxa de amortecimento real
+OMEGA_EXC = 2 * np.pi * 1.0    # Frequência da força externa (Ω)
+F0_TRUE = 1.0                  # Amplitude da força
+U0 = UDOT0 = 0.0               # Condições iniciais (posição e velocidade)
+T_TOTAL = 15.0                 # Tempo total da simulação
+T_TRAIN = 8.0                  # Tempo usado para treino
+N_STEPS = 3000                 # Total de pontos no tempo
+NOISE = 0.05                   # Nível de ruído do sensor
+EPOCHS = 30000                 # Número de épocas de treino
+
+N_TRAIN = int(N_STEPS * T_TRAIN / T_TOTAL)
+
+# mu'' + 2ζωn u' + ωn² u = F0 sin(Ω t)
+def sdof_exact(t, wn, zeta, om, f0, u0=0, udot0=0):
+    wd = wn * np.sqrt(1 - zeta**2)
+    den = (wn**2 - om**2)**2 + (2 * zeta * wn * om)**2
+
+    C, D = f0 * (wn**2 - om**2) / den, -f0 * (2 * zeta * wn * om) / den
+    A, B = u0 - D, (udot0 + zeta * wn * (u0 - D) - om * C) / wd
+
+    e = np.exp(-zeta * wn * t)
+    u_c = e * (A * np.cos(wd * t) + B * np.sin(wd * t))
+    u_p = C * np.sin(om * t) + D * np.cos(om * t)
+
+    u = u_c + u_p
+    du_c = e * (
+        (-zeta * wn * (A * np.cos(wd * t) + B * np.sin(wd * t)))
+        + (-A * wd * np.sin(wd * t) + B * wd * np.cos(wd * t))
+    )
+    udot = du_c + om * (C * np.cos(om * t) - D * np.sin(om * t))
+    uddot = f0 * np.sin(om * t) - 2 * zeta * wn * udot - wn**2 * u
+
+    return u, udot, uddot, u_c, u_p
+
+# Geração de dados sintéticos com ruído
+t_all = np.linspace(0, T_TOTAL, N_STEPS, dtype=np.float64)
+u_cl, ud_cl, udd_cl, uc_cl, up_cl = sdof_exact(t_all, WN_TRUE, ZETA_TRUE, OMEGA_EXC, F0_TRUE)
+noise_std = NOISE * np.max(np.abs(u_cl))
+u_noisy = u_cl + np.random.normal(0, noise_std, N_STEPS)
+u_train = u_noisy[:N_TRAIN].astype(np.float32)
+t_train = t_all[:N_TRAIN].astype(np.float32)
+
+# Normalização dos dados
+U_SCALE = float(np.max(np.abs(u_cl)))
+tau_train = (t_train * OMEGA_EXC).astype(np.float32)
+tau_all_f = (t_all * OMEGA_EXC).astype(np.float32)
+TAU_TRAIN = T_TRAIN * OMEGA_EXC
+u_train_n = (u_train / U_SCALE).astype(np.float32)
+F0_NORM = float(F0_TRUE / (U_SCALE * OMEGA_EXC**2))
+
+dt = float(t_train[1] - t_train[0])
+fm = np.abs(np.fft.rfft(u_train_n * np.hanning(N_TRAIN)))          # Transformada de Fourier do sinal com janela Hanning
+ff = np.fft.rfftfreq(N_TRAIN, dt)                                  # Frequências correspondentes
+p1 = np.argmax(fm[1:]) + 1                                         # Índice da frequência dominante
+
+om_fft = 2 * np.pi * ff[p1]
+om_tau_0 = om_fft / OMEGA_EXC
+wn_tau_0 = WN_TRUE / OMEGA_EXC
+ze_0 = 0.10
+
+print(f"U_SCALE={U_SCALE:.5f}  F0_NORM={F0_NORM:.4f}  TAU_TRAIN={TAU_TRAIN:.2f}")
+print(f"FFT: om_tau_0={om_tau_0:.4f}  wn_tau_0={wn_tau_0:.4f}")
+
+# Arquitetura do PINN
+class PINN(nn.Module):
+    def __init__(self, hidden=64, n_layers=3, wn0=1.5, om0=1.0, ze0=0.1):
+        super().__init__()
+        # Rede Neural (MLP) que prevê a amplitude do envelope do sinal [A, B]
+        seq = [nn.Linear(1, hidden), nn.Tanh()]
+        for _ in range(n_layers - 1):
+            seq += [nn.Linear(hidden, hidden), nn.Tanh()]
+        seq.append(nn.Linear(hidden, 2))
+        self.net = nn.Sequential
+
+        # Inicialização de pesos Xavier
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+        # Parâmetros físicos que serão aprendidos: wn, om e zeta
+        # Armazenados em escala logarítmica para garantir positividade
+        self.log_wn = nn.Parameter(torch.tensor(float(np.log(wn0))))
+        self.log_om = nn.Parameter(torch.tensor(float(np.log(om0))))
+        self.raw_ze = nn.Parameter(torch.tensor(float(np.log(ze0 / (1 - ze0)))))
+
+    # Os parametros são recuperados via exp com um clamp para evitar valores extremos
+    @property
+    def wn_tau(self): return torch.exp(self.log_wn.clamp(-1.5, 1.5))
+    @property
+    def om_tau(self): return torch.exp(self.log_om.clamp(-1.5, 1.5))
+    @property
+    def zeta(self): return torch.sigmoid(self.raw_ze) * 0.49 + 0.001
+
+    def wn_phys(self): return self.wn_tau * OMEGA_EXC
+    def om_phys(self): return self.om_tau * OMEGA_EXC
+
+    def forward(self, tau):
+        # Separa a saída em A(tau) e B(tau) e modula a oscilação harmônica
+        AB = self.net(tau)
+        A = AB[:, 0:1]
+        B = AB[:, 1:2]
+        om = self.om_tau
+        u = A * torch.sin(om * tau) + B * torch.cos(om * tau)
+        return u
+
+
+# Cálculo de derivadas
+def deriv(f, x, n=1):
+    for _ in range(n):
+        f, = torch.autograd.grad(
+            f, x, torch.ones_like(f), create_graph=True, retain_graph=True
+        )
+    return f
+
+F0_T = torch.tensor(F0_NORM, dtype=torch.float32)
+
+def loss_fn(model, tau_d, u_d, tau_p, w_phys=1., w_ic=100.):
+    wn, om, ze = model.wn_tau, model.om_tau, model.zeta
+
+    # L_data
+    u_hat = model(tau_d)
+    l_d = torch.mean((u_hat - u_d) **2)
+
+    # L_phys
+    u_p = model(tau_p)
+    du = deriv(u_p, tau_p, 1)
+    ddu = deriv(u_p, tau_p, 2)
+    res = ddu + 2 * ze * wn * du + wn**2 * u_p - F0_T * torch.sin(om * tau_p)
+    l_p = torch.mean(res**2)
+
+    # L_ic
+    tau0 = torch.zeros(1, 1, requires_grad=True)
+    u0h = model(tau0)
+    du0h = deriv(u0h, tau0, 1)
+    l_ic = (u0h - (U0 / U_SCALE))**2 + (du0h - (UDOT0 / (U_SCALE * OMEGA_EXC)))**2
+
+    # L_total
+    return l_d + w_phys * l_p + w_ic * l_ic, {
+        'd': l_d.item(), 'p': l_p.item(),
+        'wn': model.wn_phys().item(), 'om': model.om_phys().item(), 'ze': ze.item()
+    }
+
+# Preparação dos tensores de treino
+tau_d = torch.tensor(tau_train.reshape(-1, 1), requires_grad=True)
+u_d = torch.tensor(u_train_n.reshape(-1, 1))
+tau_p = torch.tensor(
+    np.linspace(0, TAU_TRAIN, 600, dtype=np.float32).reshape(-1, 1),
+    requires_grad=True
+)
+
+
+model = PINN(hidden=64, n_layers=3, wn0=wn_tau_0, om0=om_tau_0, ze0=ze_0)
+opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=500, factor=0.5, min_lr=5e-6)
+hist = {k: [] for k in ['tot', 'd', 'p', 'wn', 'om', 'ze']}
+
+print(f"\n{'Época':>7} {'L_data':>10} {'L_phys':>10} {'ωn':>9} {'ζ':>9} {'Ω':>9}")
+print("─" * 65)
+
+# Loop de treinamento
+for ep in range(1, EPOCHS + 1):
+    w_ph = 1.0
+
+    opt.zero_grad()
+    loss, p = loss_fn(model, tau_d, u_d, tau_p, w_phys=w_ph, w_ic=100.)
+    loss.backward()
+
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    sch.step(loss)
+
+    # Histórico de métricas
+    for k, v in zip(['tot', 'd', 'p', 'wn', 'om', 'ze'],
+                    [loss.item(), p['d'], p['p'], p['wn'], p['om'], p['ze']]):
+        hist[k].append(v)
+
+    if ep % 2500 == 0 or ep == 1:
+        print(f"{ep:>7} {p['d']:>10.3e} {p['p']:>10.3e} {p['wn']:>9.4f} {p['ze']:>9.5f} {p['om']:>9.4f}")
+
+wn_f = model.wn_phys().item()
+ze_f = model.zeta.item()
+om_f = model.om_phys().item()
+
+print(f"\n{'═'*50}")
+print(f"  {'':10} {'Real':>10} {'PINN':>12} {'Erro%':>8}")
+print(f"  {'ωn':<10} {WN_TRUE:>10.4f} {wn_f:>12.4f} {abs(wn_f - WN_TRUE) / WN_TRUE * 100:>7.2f}%")
+print(f"  {'ζ':<10} {ZETA_TRUE:>10.5f} {ze_f:>12.5f} {abs(ze_f - ZETA_TRUE) / ZETA_TRUE * 100:>7.2f}%")
+print(f"  {'Ω':<10} {OMEGA_EXC:>10.4f} {om_f:>12.4f} {abs(om_f - OMEGA_EXC) / OMEGA_EXC * 100:>7.2f}%")
+print(f"{'═'*50}")
+
+# Predição no domínio completo (treino + extrapolação)
+tau_full = torch.tensor(tau_all_f.reshape(-1, 1))
+with torch.no_grad():
+    u_pred = model(tau_full).numpy().flatten() * U_SCALE
+
+# Decomposição analítica com parâmetros identificados
+_, _, _, uc_id, up_id = sdof_exact(t_all, wn_f, ze_f, om_f, F0_TRUE)
+
+ep_arr = np.arange(1, EPOCHS + 1)
+
+fig = plt.figure(figsize=(16, 13))
+fig.suptitle(
+    f"PINN – SDOF Forçado: Identificação de Parâmetros Modais\n"
+    f"ωn = {wn_f:.4f} rad/s  |  ζ = {ze_f:.5f}  |  Ω = {om_f:.4f} rad/s",
+    fontsize=13, fontweight="bold"
+)
+gs = fig.add_gridspec(3, 2, hspace=0.45, wspace=0.32)
+
+# ── Painel 1 (largo): resposta total ──────────────────────
+ax0 = fig.add_subplot(gs[0, :])
+ax0.axvspan(0, T_TRAIN, alpha=0.08, color="steelblue", label="Período de treino")
+ax0.plot(t_all, u_cl, "k-", lw=2.0, label="u(t) analítico (real)")
+ax0.plot(t_all, u_pred, "r--", lw=1.8, label="PINN predito")
+ax0.scatter(t_train[::10], u_train[::10], s=10, color="steelblue",
+            alpha=0.5, zorder=4, label=f"Dados medidos (ruído {NOISE*100:.0f}%)")
+ax0.axvline(T_TRAIN, color="gray", lw=1.2, ls="--", label="Fim do treino")
+ax0.set_xlabel("t [s]")
+ax0.set_ylabel("u(t) [m]")
+ax0.set_title("Resposta total: período de treino + extrapolação")
+ax0.legend(fontsize=9, ncol=2)
+ax0.grid(True, alpha=0.3)
+
+# ── Painel 2 (largo): decomposição transiente + permanente ─
+ax1 = fig.add_subplot(gs[1, :])
+ax1.axvspan(0, T_TRAIN, alpha=0.08, color="steelblue")
+ax1.plot(t_all, uc_cl, "b-",  lw=2.0, label="u_c(t) transiente — parâm. reais")
+ax1.plot(t_all, up_cl, "g-",  lw=2.0, label="u_p(t) permanente — parâm. reais")
+ax1.plot(t_all, uc_id, "b--", lw=1.6, alpha=0.75, label="u_c(t) transiente — parâm. PINN")
+ax1.plot(t_all, up_id, "g--", lw=1.6, alpha=0.75, label="u_p(t) permanente — parâm. PINN")
+ax1.axvline(T_TRAIN, color="gray", lw=1.2, ls="--")
+ax1.axhline(0, color="k", lw=0.5)
+ax1.set_xlabel("t [s]")
+ax1.set_ylabel("u [m]")
+ax1.set_title("Decomposição: u_c(t) transiente  +  u_p(t) permanente")
+ax1.legend(fontsize=9, ncol=2)
+ax1.grid(True, alpha=0.3)
+
+# ── Painel 3: convergência de ωn e Ω ─────────────────────
+ax2 = fig.add_subplot(gs[2, 0])
+ax2.axhline(WN_TRUE,   color="k",       lw=2.0, label=f"ωn real = {WN_TRUE:.4f}")
+ax2.axhline(OMEGA_EXC, color="dimgray", lw=1.5, ls=":", label=f"Ω real = {OMEGA_EXC:.4f}")
+ax2.plot(ep_arr, hist["wn"], color="crimson",  lw=1.5, label="ωn identificado")
+ax2.plot(ep_arr, hist["om"], color="mediumpurple", lw=1.5, ls="--", label="Ω identificado")
+ax2.set_xlabel("Época")
+ax2.set_ylabel("rad/s")
+ax2.set_title("Convergência: ωn e Ω")
+ax2.legend(fontsize=8)
+ax2.grid(True, alpha=0.3)
+
+# ── Painel 4: convergência de ζ + histórico de loss ───────
+ax3 = fig.add_subplot(gs[2, 1])
+ax3.axhline(ZETA_TRUE, color="k", lw=2.0, label=f"ζ real = {ZETA_TRUE:.4f}")
+ax3.plot(ep_arr, hist["ze"], color="crimson", lw=1.5, label="ζ identificado")
+ax3.set_xlabel("Época")
+ax3.set_ylabel("ζ", color="k")
+ax3.set_title("Convergência: ζ  +  Loss total")
+
+# Eixo direito: loss em escala log
+ax3r = ax3.twinx()
+ax3r.semilogy(ep_arr, hist["tot"], color="steelblue", lw=1.0, alpha=0.5, label="Loss total")
+ax3r.semilogy(ep_arr, hist["d"],   color="steelblue", lw=0.8, alpha=0.3, ls="--", label="L_data")
+ax3r.semilogy(ep_arr, hist["p"],   color="tomato",    lw=0.8, alpha=0.3, ls="--", label="L_phys")
+ax3r.set_ylabel("Loss (log)", color="steelblue")
+ax3r.tick_params(axis="y", labelcolor="steelblue")
+
+# Legenda combinada dos dois eixos
+lines1, labels1 = ax3.get_legend_handles_labels()
+lines2, labels2 = ax3r.get_legend_handles_labels()
+ax3.legend(lines1 + lines2, labels1 + labels2, fontsize=7, ncol=2)
+ax3.grid(True, alpha=0.3)
+
+plt.tight_layout()
+os.makedirs("outputs", exist_ok=True)
+plt.savefig("outputs/pinn_sdof_resultado.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("\nGráfico salvo em outputs/pinn_sdof_resultado.png")
